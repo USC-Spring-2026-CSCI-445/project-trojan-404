@@ -183,6 +183,7 @@ class PFRRTController:
         
         ######### Your code starts here #########
         self.take_measurements()
+
         if hasattr(self._pf, "visualize_particles"):
             self._pf.visualize_particles()
         if hasattr(self._pf, "visualize_estimate"):
@@ -195,14 +196,16 @@ class PFRRTController:
             est_x, est_y, est_theta = self._pf.get_estimate()
     
             converged = False
-            if hasattr(self._pf, "_particles") and len(self._pf._particles) > 0:
-                xs = np.array([p.x for p in self._pf._particles], dtype=np.float64)
-                ys = np.array([p.y for p in self._pf._particles], dtype=np.float64)
-                thetas = np.array([p.theta for p in self._pf._particles], dtype=np.float64)
+            particles = getattr(self._pf, "_particles", None)
+            if particles is not None and len(particles) > 0:
+                xs = np.array([p.x for p in particles], dtype=np.float64)
+                ys = np.array([p.y for p in particles], dtype=np.float64)
+                thetas = np.array([p.theta for p in particles], dtype=np.float64)
     
                 pos_spread = np.sqrt(np.var(xs) + np.var(ys))
-                ang_spread = np.sqrt(np.var(thetas))
-                if pos_spread < 0.06 and ang_spread < 0.20 and step > 10:
+                ang_spread = np.sqrt(np.var(np.sin(thetas)) + np.var(np.cos(thetas)))
+    
+                if pos_spread < 0.08 and ang_spread < 0.30 and step > 10:
                     converged = True
     
             if converged:
@@ -211,7 +214,10 @@ class PFRRTController:
                 )
                 break
     
-            angle_min = self.laserscan.angle_min
+            if self.laserscan is None:
+                self.rate.sleep()
+                continue
+    
             angle_increment = self.laserscan.angle_increment
             ranges = np.array(self.laserscan.ranges, dtype=np.float64)
             ranges[np.isinf(ranges)] = self.laserscan.range_max
@@ -219,13 +225,16 @@ class PFRRTController:
     
             num_ranges = len(ranges)
             mid_idx = num_ranges // 2
+    
             ten_deg = max(1, int((10.0 * math.pi / 180.0) / angle_increment))
             forty_five_deg = max(1, int((45.0 * math.pi / 180.0) / angle_increment))
     
             front_low = max(0, mid_idx - ten_deg)
             front_high = min(num_ranges, mid_idx + ten_deg + 1)
+    
             left_low = min(num_ranges - 1, mid_idx + ten_deg)
             left_high = min(num_ranges, mid_idx + forty_five_deg + 1)
+    
             right_low = max(0, mid_idx - forty_five_deg)
             right_high = max(1, mid_idx - ten_deg + 1)
     
@@ -233,16 +242,16 @@ class PFRRTController:
             left_dist = float(np.min(ranges[left_low:left_high])) if left_high > left_low else self.laserscan.range_max
             right_dist = float(np.min(ranges[right_low:right_high])) if right_high > right_low else self.laserscan.range_max
     
-            if front_dist > 0.55:
-                self.move_forward(0.18)
-            elif front_dist > 0.32:
-                self.move_forward(0.08)
+            if front_dist > 0.60:
+                self.move_forward(0.20)
+            elif front_dist > 0.35:
+                self.move_forward(0.10)
             else:
-                self.move_forward(-0.06)
+                self.move_forward(-0.08)
                 if left_dist >= right_dist:
-                    self.rotate_in_place(pi / 2.0)
+                    self.rotate_in_place(pi / 3.0)
                 else:
-                    self.rotate_in_place(-pi / 2.0)
+                    self.rotate_in_place(-pi / 3.0)
     
             rospy.sleep(0.1)
             self.take_measurements()
@@ -269,12 +278,17 @@ class PFRRTController:
         self.plan, graph = self._planner.generate_plan(start_position, self.goal_position)
         self.current_wp_idx = 0
     
+        if self.plan is None or len(self.plan) == 0:
+            rospy.logerr("RRT failed to find a path.")
+            self.plan = []
+            return
+    
         if hasattr(self._planner, "visualize_graph"):
             self._planner.visualize_graph(graph)
         if hasattr(self._planner, "visualize_plan"):
             self._planner.visualize_plan(self.plan)
     
-        rospy.loginfo(f"plan with {len(self.plan)} waypoints")
+        rospy.loginfo(f"Generated plan with {len(self.plan)} waypoints")
         ######### Your code ends here #########
 
     # ----------------------------------------------------------------------
@@ -329,6 +343,7 @@ class PFRRTController:
     
                 if front_dist < 0.18:
                     linear_cmd = 0.0
+                    angular_cmd = 0.6 if heading_error >= 0.0 else -0.6
     
             twist = Twist()
             twist.linear.x = linear_cmd
