@@ -182,7 +182,75 @@ class PFRRTController:
         """
         
         ######### Your code starts here #########
-
+        self.take_measurements()
+        if hasattr(self._pf, "visualize_particles"):
+            self._pf.visualize_particles()
+        if hasattr(self._pf, "visualize_estimate"):
+            self._pf.visualize_estimate()
+    
+        for step in range(max_steps):
+            if rospy.is_shutdown():
+                break
+    
+            est_x, est_y, est_theta = self._pf.get_estimate()
+    
+            converged = False
+            if hasattr(self._pf, "_particles") and len(self._pf._particles) > 0:
+                xs = np.array([p.x for p in self._pf._particles], dtype=np.float64)
+                ys = np.array([p.y for p in self._pf._particles], dtype=np.float64)
+                thetas = np.array([p.theta for p in self._pf._particles], dtype=np.float64)
+    
+                pos_spread = np.sqrt(np.var(xs) + np.var(ys))
+                ang_spread = np.sqrt(np.var(thetas))
+                if pos_spread < 0.06 and ang_spread < 0.20 and step > 10:
+                    converged = True
+    
+            if converged:
+                rospy.loginfo(
+                    f"PF converged near x={est_x:.3f}, y={est_y:.3f}, theta={est_theta:.3f}"
+                )
+                break
+    
+            angle_min = self.laserscan.angle_min
+            angle_increment = self.laserscan.angle_increment
+            ranges = np.array(self.laserscan.ranges, dtype=np.float64)
+            ranges[np.isinf(ranges)] = self.laserscan.range_max
+            ranges[np.isnan(ranges)] = self.laserscan.range_max
+    
+            num_ranges = len(ranges)
+            mid_idx = num_ranges // 2
+            ten_deg = max(1, int((10.0 * math.pi / 180.0) / angle_increment))
+            forty_five_deg = max(1, int((45.0 * math.pi / 180.0) / angle_increment))
+    
+            front_low = max(0, mid_idx - ten_deg)
+            front_high = min(num_ranges, mid_idx + ten_deg + 1)
+            left_low = min(num_ranges - 1, mid_idx + ten_deg)
+            left_high = min(num_ranges, mid_idx + forty_five_deg + 1)
+            right_low = max(0, mid_idx - forty_five_deg)
+            right_high = max(1, mid_idx - ten_deg + 1)
+    
+            front_dist = float(np.min(ranges[front_low:front_high])) if front_high > front_low else self.laserscan.range_max
+            left_dist = float(np.min(ranges[left_low:left_high])) if left_high > left_low else self.laserscan.range_max
+            right_dist = float(np.min(ranges[right_low:right_high])) if right_high > right_low else self.laserscan.range_max
+    
+            if front_dist > 0.55:
+                self.move_forward(0.18)
+            elif front_dist > 0.32:
+                self.move_forward(0.08)
+            else:
+                self.move_forward(-0.06)
+                if left_dist >= right_dist:
+                    self.rotate_in_place(pi / 2.0)
+                else:
+                    self.rotate_in_place(-pi / 2.0)
+    
+            rospy.sleep(0.1)
+            self.take_measurements()
+    
+            if hasattr(self._pf, "visualize_particles"):
+                self._pf.visualize_particles()
+            if hasattr(self._pf, "visualize_estimate"):
+                self._pf.visualize_estimate()
         ######### Your code ends here #########
 
         
@@ -195,7 +263,18 @@ class PFRRTController:
         Generate a path using RRT from PF-estimated start to known goal.
         """
         ######### Your code starts here #########
-
+        est_x, est_y, est_theta = self._pf.get_estimate()
+        start_position = {"x": est_x, "y": est_y}
+    
+        self.plan, graph = self._planner.generate_plan(start_position, self.goal_position)
+        self.current_wp_idx = 0
+    
+        if hasattr(self._planner, "visualize_graph"):
+            self._planner.visualize_graph(graph)
+        if hasattr(self._planner, "visualize_plan"):
+            self._planner.visualize_plan(self.plan)
+    
+        rospy.loginfo(f"plan with {len(self.plan)} waypoints")
         ######### Your code ends here #########
 
     # ----------------------------------------------------------------------
@@ -207,7 +286,58 @@ class PFRRTController:
         Keep updating PF along the way.
         """
         ######### Your code starts here #########
-
+        if self.plan is None or len(self.plan) == 0:
+            rospy.logwarn("No plan available to follow.")
+            return
+    
+        while not rospy.is_shutdown() and self.current_wp_idx < len(self.plan):
+            self.take_measurements()
+            est_x, est_y, est_theta = self._pf.get_estimate()
+    
+            waypoint = self.plan[self.current_wp_idx]
+            dx = waypoint["x"] - est_x
+            dy = waypoint["y"] - est_y
+            distance_error = sqrt(dx * dx + dy * dy)
+    
+            if distance_error <= GOAL_THRESHOLD:
+                self.current_wp_idx += 1
+                continue
+    
+            desired_heading = atan2(dy, dx)
+            heading_error = angle_to_neg_pi_to_pi(desired_heading - est_theta)
+    
+            now = rospy.Time.now().to_sec()
+            angular_cmd = self.angular_pid.control(heading_error, now)
+    
+            if abs(heading_error) > 0.35:
+                linear_cmd = 0.0
+            else:
+                linear_cmd = self.linear_pid.control(distance_error, now)
+                linear_cmd = max(0.0, min(0.20, linear_cmd))
+    
+            if self.laserscan is not None:
+                ranges = np.array(self.laserscan.ranges, dtype=np.float64)
+                ranges[np.isinf(ranges)] = self.laserscan.range_max
+                ranges[np.isnan(ranges)] = self.laserscan.range_max
+    
+                mid_idx = len(ranges) // 2
+                angle_increment = self.laserscan.angle_increment
+                ten_deg = max(1, int((10.0 * math.pi / 180.0) / angle_increment))
+                front_low = max(0, mid_idx - ten_deg)
+                front_high = min(len(ranges), mid_idx + ten_deg + 1)
+                front_dist = float(np.min(ranges[front_low:front_high]))
+    
+                if front_dist < 0.18:
+                    linear_cmd = 0.0
+    
+            twist = Twist()
+            twist.linear.x = linear_cmd
+            twist.angular.z = angular_cmd
+            self.cmd_pub.publish(twist)
+            self.rate.sleep()
+    
+        self.cmd_pub.publish(Twist())
+        rospy.loginfo("Finished following plan.")
         ######### Your code ends here #########
 
     # ----------------------------------------------------------------------
