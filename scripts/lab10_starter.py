@@ -131,13 +131,25 @@ class RrtPlanner:
     def _randomly_sample_q(self) -> Node:
         # Choose uniform randomly sampled points
         ######### Your code starts here #########
-
+        x_min, x_max, y_min, y_max = self.map_aabb
+        x = np.random.uniform(x_min, x_max)
+        y = np.random.uniform(y_min, y_max)
+        return Node(np.array([x, y]), None)
         ######### Your code ends here #########
 
     def _nearest_vertex(self, graph: List[Node], q: Node) -> Node:
         # Determine vertex nearest to sampled point
         ######### Your code starts here #########
-
+        nearest = graph[0]
+        min_dist = np.linalg.norm(q.position - nearest.position)
+        
+        for node in graph:
+            dist = np.linalg.norm(q.position - node.position)
+            if dist < min_dist:
+                min_dist = dist
+                nearest = node
+        
+        return nearest
         ######### Your code ends here #########
 
     def _is_in_collision(self, q_rand: Node):
@@ -157,7 +169,31 @@ class RrtPlanner:
 
         # Check if sampled point is in collision and add to tree if not
         ######### Your code starts here #########
-
+        if self._is_in_collision(q_rand):
+            return None
+        
+        q_near = self._nearest_vertex(graph, q_rand)
+        direction = q_rand.position - q_near.position
+        dist = np.linalg.norm(direction)
+        
+        if dist == 0:
+            return None
+        
+        if dist <= self.delta:
+            new_position = q_rand.position.copy()
+        else:
+            new_position = q_near.position + (direction / dist) * self.delta
+        
+        q_new = Node(new_position, q_near)
+        
+        if self._is_in_collision(q_new):
+            return None
+        
+        q_near.neighbors.append(q_new)
+        q_new.parent = q_near
+        graph.append(q_new)
+        
+        return q_new
         ######### Your code ends here #########
 
     def generate_plan(self, start: POSITION_TYPE, goal: POSITION_TYPE) -> Tuple[List[POSITION_TYPE], List[Node]]:
@@ -184,7 +220,37 @@ class RrtPlanner:
 
         # Find path from start to goal location through tree
         ######### Your code starts here #########
-
+        max_iterations = 10000
+        found_goal_node = None
+        
+        for _ in range(max_iterations):
+            q_rand = self._randomly_sample_q()
+            q_new = self._extend(graph, q_rand)
+        
+            if q_new is None:
+                continue
+        
+            if np.linalg.norm(q_new.position - goal_node.position) <= self.goal_threshold:
+                found_goal_node = q_new
+                break
+        
+        if found_goal_node is None:
+            return plan, graph
+        
+        backtrack = []
+        current = found_goal_node
+        while current is not None:
+            backtrack.append({"x": current.position[0], "y": current.position[1]})
+            current = current.parent
+        
+        backtrack.reverse()
+        
+        if len(backtrack) == 0 or (
+            abs(backtrack[-1]["x"] - goal["x"]) > 1e-6 or abs(backtrack[-1]["y"] - goal["y"]) > 1e-6
+        ):
+            backtrack.append({"x": goal["x"], "y": goal["y"]})
+        
+        plan = backtrack
 
         ######### Your code ends here #########
         return plan, graph
@@ -193,6 +259,74 @@ class RrtPlanner:
 # Protip: copy the ObstacleFreeWaypointController class from lab5.py here
 ######### Your code starts here #########
 
+class ObstacleFreeWaypointController:
+    def __init__(self, waypoints: List[POSITION_TYPE]):
+        self.waypoints = waypoints
+        self.waypoint_idx = 0
+
+        self.current_position = {"x": 0.0, "y": 0.0, "theta": 0.0}
+
+        self.cmd_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+        self.odom_sub = rospy.Subscriber("/odom", Odometry, self._odom_callback)
+
+        self.goal_threshold = GOAL_THRESHOLD
+        self.max_linear_speed = 0.2
+        self.max_angular_speed = 0.8
+
+        self.rate = rospy.Rate(10)
+
+    def _odom_callback(self, msg: Odometry):
+        self.current_position["x"] = msg.pose.pose.position.x
+        self.current_position["y"] = msg.pose.pose.position.y
+
+        q = msg.pose.pose.orientation
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self.current_position["theta"] = yaw
+
+    def _stop_robot(self):
+        twist = Twist()
+        twist.linear.x = 0.0
+        twist.angular.z = 0.0
+        self.cmd_pub.publish(twist)
+
+    def control_robot(self):
+        if self.waypoint_idx >= len(self.waypoints):
+            self._stop_robot()
+            self.rate.sleep()
+            return
+    
+        target = self.waypoints[self.waypoint_idx]
+    
+        dx = target["x"] - self.current_position["x"]
+        dy = target["y"] - self.current_position["y"]
+        distance_error = sqrt(dx**2 + dy**2)
+    
+        if distance_error < self.goal_threshold:
+            self.waypoint_idx += 1
+            if self.waypoint_idx >= len(self.waypoints):
+                self._stop_robot()
+            self.rate.sleep()
+            return
+    
+        desired_theta = atan2(dy, dx)
+        angle_error = desired_theta - self.current_position["theta"]
+    
+        while angle_error > pi:
+            angle_error -= 2 * pi
+        while angle_error < -pi:
+            angle_error += 2 * pi
+    
+        twist = Twist()
+    
+        if abs(angle_error) > 0.2:
+            twist.linear.x = 0.0
+        else:
+            twist.linear.x = min(self.max_linear_speed, 0.15 * distance_error)
+    
+        twist.angular.z = max(-self.max_angular_speed, min(self.max_angular_speed, 1.2 * angle_error))
+    
+        self.cmd_pub.publish(twist)
+        self.rate.sleep()
 ######### Your code ends here #########
 
 
