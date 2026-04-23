@@ -183,79 +183,180 @@ class PFRRTController:
         
         ######### Your code starts here #########
         self.take_measurements()
-
+        
+        def pf_resample():
+            particles = getattr(self._pf, "_particles", None)
+            if particles is None or len(particles) == 0:
+                return
+        
+            log_ps = np.array([p.log_p for p in particles], dtype=np.float64)
+            max_log_p = np.max(log_ps)
+        
+            if np.isneginf(max_log_p):
+                uniform_log_p = math.log(1.0 / len(particles))
+                for p in particles:
+                    p.log_p = uniform_log_p
+                return
+        
+            weights = np.exp(log_ps - max_log_p)
+            weights_sum = np.sum(weights)
+        
+            if weights_sum <= 0 or np.isnan(weights_sum):
+                weights = np.ones(len(particles), dtype=np.float64) / len(particles)
+            else:
+                weights = weights / weights_sum
+        
+            x_min, x_max, y_min, y_max = self._pf._map.map_aabb
+        
+            def is_valid(x: float, y: float) -> bool:
+                if not (x_min <= x <= x_max and y_min <= y <= y_max):
+                    return False
+                for obs in self._pf._map.obstacles:
+                    if obs[0] <= x <= obs[1] and obs[2] <= y <= obs[3]:
+                        return False
+                return True
+        
+            old_particles = getattr(__import__("copy"), "deepcopy")(particles)
+            indices = np.random.choice(
+                len(old_particles),
+                size=len(old_particles),
+                replace=True,
+                p=weights
+            )
+        
+            new_particles = []
+            uniform_log_p = math.log(1.0 / len(old_particles))
+        
+            for idx in indices:
+                p = old_particles[idx]
+                particle_cls = type(p)
+        
+                new_x = p.x + np.random.normal(0.0, 0.02)
+                new_y = p.y + np.random.normal(0.0, 0.02)
+                new_theta = angle_to_neg_pi_to_pi(p.theta + np.random.normal(0.0, 0.02))
+        
+                if not is_valid(new_x, new_y):
+                    new_x = p.x
+                    new_y = p.y
+                    new_theta = p.theta
+        
+                new_particles.append(particle_cls(new_x, new_y, new_theta, uniform_log_p))
+        
+            self._pf._particles = new_particles
+        
+        pf_resample()
+        
         if hasattr(self._pf, "visualize_particles"):
             self._pf.visualize_particles()
         if hasattr(self._pf, "visualize_estimate"):
             self._pf.visualize_estimate()
-    
+        
+        stuck_count = 0
+        prev_est = None
+        
         for step in range(max_steps):
             if rospy.is_shutdown():
                 break
-    
+        
             est_x, est_y, est_theta = self._pf.get_estimate()
-    
+        
             converged = False
             particles = getattr(self._pf, "_particles", None)
             if particles is not None and len(particles) > 0:
                 xs = np.array([p.x for p in particles], dtype=np.float64)
                 ys = np.array([p.y for p in particles], dtype=np.float64)
                 thetas = np.array([p.theta for p in particles], dtype=np.float64)
-    
+        
                 pos_spread = np.sqrt(np.var(xs) + np.var(ys))
                 ang_spread = np.sqrt(np.var(np.sin(thetas)) + np.var(np.cos(thetas)))
-    
-                if pos_spread < 0.08 and ang_spread < 0.30 and step > 10:
+        
+                if pos_spread < 0.08 and ang_spread < 0.30 and step > 15:
                     converged = True
-    
+        
             if converged:
                 rospy.loginfo(
                     f"PF converged near x={est_x:.3f}, y={est_y:.3f}, theta={est_theta:.3f}"
                 )
                 break
-    
+        
             if self.laserscan is None:
                 self.rate.sleep()
                 continue
-    
-            angle_increment = self.laserscan.angle_increment
+        
             ranges = np.array(self.laserscan.ranges, dtype=np.float64)
             ranges[np.isinf(ranges)] = self.laserscan.range_max
             ranges[np.isnan(ranges)] = self.laserscan.range_max
-    
+        
             num_ranges = len(ranges)
             mid_idx = num_ranges // 2
-    
-            ten_deg = max(1, int((10.0 * math.pi / 180.0) / angle_increment))
-            forty_five_deg = max(1, int((45.0 * math.pi / 180.0) / angle_increment))
-    
-            front_low = max(0, mid_idx - ten_deg)
-            front_high = min(num_ranges, mid_idx + ten_deg + 1)
-    
-            left_low = min(num_ranges - 1, mid_idx + ten_deg)
-            left_high = min(num_ranges, mid_idx + forty_five_deg + 1)
-    
-            right_low = max(0, mid_idx - forty_five_deg)
-            right_high = max(1, mid_idx - ten_deg + 1)
-    
+            angle_increment = self.laserscan.angle_increment
+        
+            front_span = max(1, int((12.0 * math.pi / 180.0) / angle_increment))
+            side_low = max(1, int((35.0 * math.pi / 180.0) / angle_increment))
+            side_high = max(1, int((70.0 * math.pi / 180.0) / angle_increment))
+        
+            front_low = max(0, mid_idx - front_span)
+            front_high = min(num_ranges, mid_idx + front_span + 1)
+        
+            left_low = min(num_ranges - 1, mid_idx + side_low)
+            left_high = min(num_ranges, mid_idx + side_high + 1)
+        
+            right_low = max(0, mid_idx - side_high)
+            right_high = max(1, mid_idx - side_low + 1)
+        
             front_dist = float(np.min(ranges[front_low:front_high])) if front_high > front_low else self.laserscan.range_max
             left_dist = float(np.min(ranges[left_low:left_high])) if left_high > left_low else self.laserscan.range_max
             right_dist = float(np.min(ranges[right_low:right_high])) if right_high > right_low else self.laserscan.range_max
-    
-            if front_dist > 0.60:
-                self.move_forward(0.20)
-            elif front_dist > 0.35:
-                self.move_forward(0.10)
-            else:
-                self.move_forward(-0.08)
-                if left_dist >= right_dist:
-                    self.rotate_in_place(pi / 3.0)
+        
+            if prev_est is not None:
+                moved = math.sqrt((est_x - prev_est[0]) ** 2 + (est_y - prev_est[1]) ** 2)
+                if moved < 0.015:
+                    stuck_count += 1
                 else:
-                    self.rotate_in_place(-pi / 3.0)
-    
+                    stuck_count = 0
+            prev_est = (est_x, est_y)
+        
+            if stuck_count >= 4:
+                self.move_forward(-0.12)
+                if left_dist >= right_dist:
+                    self.rotate_in_place(pi / 2.0)
+                else:
+                    self.rotate_in_place(-pi / 2.0)
+                stuck_count = 0
+            else:
+                if front_dist < 0.22:
+                    self.move_forward(-0.10)
+                    if left_dist >= right_dist:
+                        self.rotate_in_place(pi / 2.0)
+                    else:
+                        self.rotate_in_place(-pi / 2.0)
+                elif front_dist < 0.40:
+                    if left_dist >= right_dist:
+                        self.rotate_in_place(pi / 6.0)
+                    else:
+                        self.rotate_in_place(-pi / 6.0)
+                    self.move_forward(0.06)
+                else:
+                    wall_target = 0.45
+                    if right_dist < 0.9:
+                        if right_dist < wall_target - 0.08:
+                            self.rotate_in_place(pi / 10.0)
+                        elif right_dist > wall_target + 0.08:
+                            self.rotate_in_place(-pi / 10.0)
+                        self.move_forward(0.12)
+                    elif left_dist < 0.9:
+                        if left_dist < wall_target - 0.08:
+                            self.rotate_in_place(-pi / 10.0)
+                        elif left_dist > wall_target + 0.08:
+                            self.rotate_in_place(pi / 10.0)
+                        self.move_forward(0.12)
+                    else:
+                        self.move_forward(0.15)
+        
             rospy.sleep(0.1)
             self.take_measurements()
-    
+            pf_resample()
+        
             if hasattr(self._pf, "visualize_particles"):
                 self._pf.visualize_particles()
             if hasattr(self._pf, "visualize_estimate"):
@@ -272,23 +373,23 @@ class PFRRTController:
         Generate a path using RRT from PF-estimated start to known goal.
         """
         ######### Your code starts here #########
-        est_x, est_y, est_theta = self._pf.get_estimate()
+        est_x, est_y, _ = self._pf.get_estimate()
         start_position = {"x": est_x, "y": est_y}
-    
+        
         self.plan, graph = self._planner.generate_plan(start_position, self.goal_position)
         self.current_wp_idx = 0
-    
+        
         if self.plan is None or len(self.plan) == 0:
             rospy.logerr("RRT failed to find a path.")
             self.plan = []
             return
-    
+        
         if hasattr(self._planner, "visualize_graph"):
             self._planner.visualize_graph(graph)
         if hasattr(self._planner, "visualize_plan"):
             self._planner.visualize_plan(self.plan)
-    
-        rospy.loginfo(f"Generated plan with {len(self.plan)} waypoints")
+        
+        rospy.loginfo(f"new plan with {len(self.plan)} waypoints")
         ######### Your code ends here #########
 
     # ----------------------------------------------------------------------
@@ -303,56 +404,176 @@ class PFRRTController:
         if self.plan is None or len(self.plan) == 0:
             rospy.logwarn("No plan available to follow.")
             return
-    
+        
+        def pf_resample():
+            particles = getattr(self._pf, "_particles", None)
+            if particles is None or len(particles) == 0:
+                return
+        
+            log_ps = np.array([p.log_p for p in particles], dtype=np.float64)
+            max_log_p = np.max(log_ps)
+        
+            if np.isneginf(max_log_p):
+                uniform_log_p = math.log(1.0 / len(particles))
+                for p in particles:
+                    p.log_p = uniform_log_p
+                return
+        
+            weights = np.exp(log_ps - max_log_p)
+            weights_sum = np.sum(weights)
+        
+            if weights_sum <= 0 or np.isnan(weights_sum):
+                weights = np.ones(len(particles), dtype=np.float64) / len(particles)
+            else:
+                weights = weights / weights_sum
+        
+            x_min, x_max, y_min, y_max = self._pf._map.map_aabb
+        
+            def is_valid(x: float, y: float) -> bool:
+                if not (x_min <= x <= x_max and y_min <= y <= y_max):
+                    return False
+                for obs in self._pf._map.obstacles:
+                    if obs[0] <= x <= obs[1] and obs[2] <= y <= obs[3]:
+                        return False
+                return True
+        
+            old_particles = getattr(__import__("copy"), "deepcopy")(particles)
+            indices = np.random.choice(
+                len(old_particles),
+                size=len(old_particles),
+                replace=True,
+                p=weights
+            )
+        
+            new_particles = []
+            uniform_log_p = math.log(1.0 / len(old_particles))
+        
+            for idx in indices:
+                p = old_particles[idx]
+                particle_cls = type(p)
+        
+                new_x = p.x + np.random.normal(0.0, 0.01)
+                new_y = p.y + np.random.normal(0.0, 0.01)
+                new_theta = angle_to_neg_pi_to_pi(p.theta + np.random.normal(0.0, 0.01))
+        
+                if not is_valid(new_x, new_y):
+                    new_x = p.x
+                    new_y = p.y
+                    new_theta = p.theta
+        
+                new_particles.append(particle_cls(new_x, new_y, new_theta, uniform_log_p))
+        
+            self._pf._particles = new_particles
+        
+        stuck_counter = 0
+        prev_est = None
+        replan_counter = 0
+        
         while not rospy.is_shutdown() and self.current_wp_idx < len(self.plan):
             self.take_measurements()
+            pf_resample()
+        
             est_x, est_y, est_theta = self._pf.get_estimate()
-    
+        
+            if prev_est is not None:
+                moved = math.sqrt((est_x - prev_est[0]) ** 2 + (est_y - prev_est[1]) ** 2)
+                if moved < 0.01:
+                    stuck_counter += 1
+                else:
+                    stuck_counter = 0
+            prev_est = (est_x, est_y)
+        
             waypoint = self.plan[self.current_wp_idx]
             dx = waypoint["x"] - est_x
             dy = waypoint["y"] - est_y
             distance_error = sqrt(dx * dx + dy * dy)
-    
+        
             if distance_error <= GOAL_THRESHOLD:
                 self.current_wp_idx += 1
                 continue
-    
+        
             desired_heading = atan2(dy, dx)
             heading_error = angle_to_neg_pi_to_pi(desired_heading - est_theta)
-    
-            now = rospy.Time.now().to_sec()
-            angular_cmd = self.angular_pid.control(heading_error, now)
-    
-            if abs(heading_error) > 0.35:
-                linear_cmd = 0.0
-            else:
-                linear_cmd = self.linear_pid.control(distance_error, now)
-                linear_cmd = max(0.0, min(0.20, linear_cmd))
-    
+        
             if self.laserscan is not None:
                 ranges = np.array(self.laserscan.ranges, dtype=np.float64)
                 ranges[np.isinf(ranges)] = self.laserscan.range_max
                 ranges[np.isnan(ranges)] = self.laserscan.range_max
-    
+        
                 mid_idx = len(ranges) // 2
                 angle_increment = self.laserscan.angle_increment
-                ten_deg = max(1, int((10.0 * math.pi / 180.0) / angle_increment))
-                front_low = max(0, mid_idx - ten_deg)
-                front_high = min(len(ranges), mid_idx + ten_deg + 1)
-                front_dist = float(np.min(ranges[front_low:front_high]))
-    
-                if front_dist < 0.18:
-                    linear_cmd = 0.0
-                    angular_cmd = 0.6 if heading_error >= 0.0 else -0.6
-    
+        
+                front_span = max(1, int((12.0 * math.pi / 180.0) / angle_increment))
+                side_low = max(1, int((30.0 * math.pi / 180.0) / angle_increment))
+                side_high = max(1, int((65.0 * math.pi / 180.0) / angle_increment))
+        
+                front_low = max(0, mid_idx - front_span)
+                front_high = min(len(ranges), mid_idx + front_span + 1)
+                left_low = min(len(ranges) - 1, mid_idx + side_low)
+                left_high = min(len(ranges), mid_idx + side_high + 1)
+                right_low = max(0, mid_idx - side_high)
+                right_high = max(1, mid_idx - side_low + 1)
+        
+                front_dist = float(np.min(ranges[front_low:front_high])) if front_high > front_low else self.laserscan.range_max
+                left_dist = float(np.min(ranges[left_low:left_high])) if left_high > left_low else self.laserscan.range_max
+                right_dist = float(np.min(ranges[right_low:right_high])) if right_high > right_low else self.laserscan.range_max
+            else:
+                front_dist = 10.0
+                left_dist = 10.0
+                right_dist = 10.0
+        
+            if front_dist < 0.18:
+                self.cmd_pub.publish(Twist())
+                self.move_forward(-0.08)
+                if left_dist >= right_dist:
+                    self.rotate_in_place(pi / 4.0)
+                else:
+                    self.rotate_in_place(-pi / 4.0)
+        
+                replan_counter += 1
+                if replan_counter >= 2:
+                    self.plan_with_rrt()
+                    if self.plan is None or len(self.plan) == 0:
+                        rospy.logwarn("Replan failed.")
+                        return
+                    self.current_wp_idx = 0
+                    replan_counter = 0
+                continue
+        
+            if stuck_counter >= 6:
+                self.cmd_pub.publish(Twist())
+                self.move_forward(-0.10)
+                if left_dist >= right_dist:
+                    self.rotate_in_place(pi / 3.0)
+                else:
+                    self.rotate_in_place(-pi / 3.0)
+        
+                self.plan_with_rrt()
+                if self.plan is None or len(self.plan) == 0:
+                    rospy.logwarn("Replan failed after stuck.")
+                    return
+                self.current_wp_idx = 0
+                stuck_counter = 0
+                replan_counter = 0
+                continue
+        
+            now = rospy.Time.now().to_sec()
+            angular_cmd = self.angular_pid.control(heading_error, now)
+        
+            if abs(heading_error) > 0.40:
+                linear_cmd = 0.0
+            else:
+                linear_cmd = self.linear_pid.control(distance_error, now)
+                linear_cmd = max(0.0, min(0.15, linear_cmd))
+        
             twist = Twist()
             twist.linear.x = linear_cmd
             twist.angular.z = angular_cmd
             self.cmd_pub.publish(twist)
             self.rate.sleep()
-    
+        
         self.cmd_pub.publish(Twist())
-        rospy.loginfo("Finished following plan.")
+        rospy.loginfo("stop following plan.")
         ######### Your code ends here #########
 
     # ----------------------------------------------------------------------
