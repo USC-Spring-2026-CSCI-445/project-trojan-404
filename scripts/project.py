@@ -182,6 +182,36 @@ class PFRRTController:
         """
         
         ######### Your code starts here #########
+
+        def clean_range(r):
+            if np.isnan(r) or np.isinf(r):
+                return self.laserscan.range_max
+            return r
+
+        def get_min_range_between_angles(low_angle, high_angle):
+            if self.laserscan is None:
+                return self.laserscan.range_max
+
+            angle_min = self.laserscan.angle_min
+            angle_inc = self.laserscan.angle_increment
+            ranges = self.laserscan.ranges
+            n = len(ranges)
+
+            low_idx = int(round((low_angle - angle_min) / angle_inc))
+            high_idx = int(round((high_angle - angle_min) / angle_inc))
+
+            low_idx = max(0, min(n - 1, low_idx))
+            high_idx = max(0, min(n - 1, high_idx))
+
+            if low_idx > high_idx:
+                low_idx, high_idx = high_idx, low_idx
+
+            sector = [clean_range(r) for r in ranges[low_idx:high_idx + 1]]
+            if len(sector) == 0:
+                return self.laserscan.range_max
+
+            return float(min(sector))
+
         self.take_measurements()
 
         if hasattr(self._pf, "visualize_particles"):
@@ -189,78 +219,113 @@ class PFRRTController:
         if hasattr(self._pf, "visualize_estimate"):
             self._pf.visualize_estimate()
 
+        close_count = 0
+        stuck_turn_count = 0
+
         for step in range(max_steps):
             if rospy.is_shutdown():
-                break
-
-            est_x, est_y, est_theta = self._pf.get_estimate()
-
-            converged = False
-            particles = getattr(self._pf, "_particles", None)
-            if particles is not None and len(particles) > 0:
-                xs = np.array([p.x for p in particles], dtype=np.float64)
-                ys = np.array([p.y for p in particles], dtype=np.float64)
-                thetas = np.array([p.theta for p in particles], dtype=np.float64)
-
-                pos_spread = np.sqrt(np.var(xs) + np.var(ys))
-                sin_var = np.var(np.sin(thetas))
-                cos_var = np.var(np.cos(thetas))
-                ang_spread = np.sqrt(sin_var + cos_var)
-
-                if pos_spread < 0.10 and ang_spread < 0.35 and step > 10:
-                    converged = True
-
-            if converged:
-                rospy.loginfo(
-                    f"PF converged near x={est_x:.3f}, y={est_y:.3f}, theta={est_theta:.3f}"
-                )
                 break
 
             if self.laserscan is None:
                 self.rate.sleep()
                 continue
 
-            ranges = np.array(self.laserscan.ranges, dtype=np.float64)
-            ranges[np.isinf(ranges)] = self.laserscan.range_max
-            ranges[np.isnan(ranges)] = self.laserscan.range_max
+            front_dist = get_min_range_between_angles(
+                -math.radians(25.0),
+                math.radians(25.0)
+            )
+            left_dist = get_min_range_between_angles(
+                math.radians(25.0),
+                math.radians(75.0)
+            )
+            right_dist = get_min_range_between_angles(
+                -math.radians(75.0),
+                -math.radians(25.0)
+            )
 
-            num_ranges = len(ranges)
-            mid_idx = num_ranges // 2
-            angle_increment = self.laserscan.angle_increment
-
-            front_span = max(1, int((12.0 * math.pi / 180.0) / angle_increment))
-            side_span = max(1, int((45.0 * math.pi / 180.0) / angle_increment))
-
-            front_low = max(0, mid_idx - front_span)
-            front_high = min(num_ranges, mid_idx + front_span + 1)
-
-            left_low = min(num_ranges - 1, mid_idx + 1)
-            left_high = min(num_ranges, mid_idx + side_span + 1)
-
-            right_low = max(0, mid_idx - side_span)
-            right_high = max(1, mid_idx)
-
-            front_dist = float(np.min(ranges[front_low:front_high])) if front_high > front_low else self.laserscan.range_max
-            left_dist = float(np.min(ranges[left_low:left_high])) if left_high > left_low else self.laserscan.range_max
-            right_dist = float(np.min(ranges[right_low:right_high])) if right_high > right_low else self.laserscan.range_max
-
-            if front_dist > 0.55:
-                self.move_forward(0.15)
-            elif front_dist > 0.30:
-                self.move_forward(0.08)
+            if front_dist < 0.35:
+                close_count += 1
             else:
-                if left_dist >= right_dist:
-                    self.rotate_in_place(pi / 4.0)
-                else:
-                    self.rotate_in_place(-pi / 4.0)
+                close_count = 0
 
-            rospy.sleep(0.1)
+            rospy.loginfo(
+                "LOCALIZE step=%d front=%.3f left=%.3f right=%.3f close_count=%d" %
+                (step, front_dist, left_dist, right_dist, close_count)
+            )
+
+            if close_count >= 1:
+                twist = Twist()
+                twist.linear.x = 0.0
+                twist.angular.z = 0.6 if left_dist >= right_dist else -0.6
+
+                start_time = rospy.Time.now().to_sec()
+                while (rospy.Time.now().to_sec() - start_time) < 0.8 and (not rospy.is_shutdown()):
+                    self.cmd_pub.publish(twist)
+                    self.rate.sleep()
+
+                self.cmd_pub.publish(Twist())
+                stuck_turn_count += 1
+
+            elif front_dist > 0.75:
+                self.move_forward(0.18)
+                stuck_turn_count = 0
+
+            elif front_dist > 0.45:
+                self.move_forward(0.10)
+                stuck_turn_count = 0
+
+            else:
+                twist = Twist()
+                twist.linear.x = 0.0
+                twist.angular.z = 0.45 if left_dist >= right_dist else -0.45
+
+                start_time = rospy.Time.now().to_sec()
+                while (rospy.Time.now().to_sec() - start_time) < 0.6 and (not rospy.is_shutdown()):
+                    self.cmd_pub.publish(twist)
+                    self.rate.sleep()
+
+                self.cmd_pub.publish(Twist())
+                stuck_turn_count += 1
+
             self.take_measurements()
 
             if hasattr(self._pf, "visualize_particles"):
                 self._pf.visualize_particles()
             if hasattr(self._pf, "visualize_estimate"):
                 self._pf.visualize_estimate()
+
+            x_est, y_est, theta_est = self._pf.get_estimate()
+            particles = getattr(self._pf, "_particles", None)
+
+            if particles is not None and len(particles) > 0:
+                xs = np.array([p.x for p in particles], dtype=np.float64)
+                ys = np.array([p.y for p in particles], dtype=np.float64)
+                thetas = np.array([p.theta for p in particles], dtype=np.float64)
+
+                pos_spread = np.sqrt(np.var(xs) + np.var(ys))
+                ang_spread = np.sqrt(np.var(np.sin(thetas)) + np.var(np.cos(thetas)))
+
+                rospy.loginfo(
+                    "PF estimate x=%.3f y=%.3f theta=%.3f pos_spread=%.3f ang_spread=%.3f" %
+                    (x_est, y_est, theta_est, pos_spread, ang_spread)
+                )
+
+                if step > 15 and pos_spread < 0.18 and ang_spread < 0.35:
+                    rospy.loginfo(
+                        "PF converged near x=%.3f, y=%.3f, theta=%.3f" %
+                        (x_est, y_est, theta_est)
+                    )
+                    break
+
+            if stuck_turn_count > 8:
+                rospy.logwarn("Too many turns during localization; stopping localization early.")
+                break
+
+            self.rate.sleep()
+
+        self.cmd_pub.publish(Twist())
+        rospy.loginfo("Localization phase complete.")
+
         ######### Your code ends here #########
 
         
@@ -273,8 +338,24 @@ class PFRRTController:
         Generate a path using RRT from PF-estimated start to known goal.
         """
         ######### Your code starts here #########
-        est_x, est_y, _ = self._pf.get_estimate()
-        start_position = {"x": est_x, "y": est_y}
+
+        x_est, y_est, theta_est = self._pf.get_estimate()
+
+        start_position = {
+            "x": x_est,
+            "y": y_est
+        }
+
+        rospy.loginfo(
+            "Planning from PF estimate x=%.3f y=%.3f theta=%.3f to goal x=%.3f y=%.3f" %
+            (
+                x_est,
+                y_est,
+                theta_est,
+                self.goal_position["x"],
+                self.goal_position["y"],
+            )
+        )
 
         self.plan, graph = self._planner.generate_plan(start_position, self.goal_position)
         self.current_wp_idx = 0
@@ -289,7 +370,11 @@ class PFRRTController:
         if hasattr(self._planner, "visualize_plan"):
             self._planner.visualize_plan(self.plan)
 
-        rospy.loginfo(f"Generated plan with {len(self.plan)} waypoints")
+        rospy.loginfo("Generated plan with %d waypoints." % len(self.plan))
+
+        for i, wp in enumerate(self.plan):
+            rospy.loginfo("WP[%d] = x=%.3f y=%.3f" % (i, wp["x"], wp["y"]))
+
         ######### Your code ends here #########
 
     # ----------------------------------------------------------------------
@@ -301,64 +386,168 @@ class PFRRTController:
         Keep updating PF along the way.
         """
         ######### Your code starts here #########
+
+        def clean_range(r):
+            if np.isnan(r) or np.isinf(r):
+                return self.laserscan.range_max
+            return r
+
+        def get_min_range_between_angles(low_angle, high_angle):
+            if self.laserscan is None:
+                return self.laserscan.range_max
+
+            angle_min = self.laserscan.angle_min
+            angle_inc = self.laserscan.angle_increment
+            ranges = self.laserscan.ranges
+            n = len(ranges)
+
+            low_idx = int(round((low_angle - angle_min) / angle_inc))
+            high_idx = int(round((high_angle - angle_min) / angle_inc))
+
+            low_idx = max(0, min(n - 1, low_idx))
+            high_idx = max(0, min(n - 1, high_idx))
+
+            if low_idx > high_idx:
+                low_idx, high_idx = high_idx, low_idx
+
+            sector = [clean_range(r) for r in ranges[low_idx:high_idx + 1]]
+            if len(sector) == 0:
+                return self.laserscan.range_max
+
+            return float(min(sector))
+
         if self.plan is None or len(self.plan) == 0:
             rospy.logwarn("No plan available to follow.")
             return
 
-        while not rospy.is_shutdown() and self.current_wp_idx < len(self.plan):
-            self.take_measurements()
-            est_x, est_y, est_theta = self._pf.get_estimate()
+        rospy.logwarn("=" * 50)
+        rospy.logwarn("FOLLOWING PLAN WITH %d WAYPOINTS" % len(self.plan))
+        for i, wp in enumerate(self.plan):
+            rospy.logwarn("WP[%d]: x=%.3f y=%.3f" % (i, wp["x"], wp["y"]))
+        rospy.logwarn("=" * 50)
 
-            waypoint = self.plan[self.current_wp_idx]
-            dx = waypoint["x"] - est_x
-            dy = waypoint["y"] - est_y
+        rate = rospy.Rate(20)
+
+        current_wp_idx = 0
+        iteration = 0
+
+        MIN_DT = 1e-3
+        last_pid_time = rospy.get_time()
+
+        while not rospy.is_shutdown():
+            if current_wp_idx >= len(self.plan):
+                self.cmd_pub.publish(Twist())
+                rospy.loginfo("Finished following plan.")
+                break
+
+            if self.current_position is None:
+                rate.sleep()
+                continue
+
+            self.take_measurements()
+
+            waypoint = self.plan[current_wp_idx]
+
+            rx = self.current_position["x"]
+            ry = self.current_position["y"]
+            rtheta = self.current_position["theta"]
+
+            dx = waypoint["x"] - rx
+            dy = waypoint["y"] - ry
+
             distance_error = sqrt(dx * dx + dy * dy)
 
             if distance_error <= GOAL_THRESHOLD:
-                self.current_wp_idx += 1
+                rospy.loginfo("Reached waypoint %d / %d" % (current_wp_idx + 1, len(self.plan)))
+                current_wp_idx += 1
+                self.linear_pid.error_sum = 0.0
+                self.angular_pid.error_sum = 0.0
+                rate.sleep()
                 continue
 
             desired_heading = atan2(dy, dx)
-            heading_error = angle_to_neg_pi_to_pi(desired_heading - est_theta)
+            heading_error = angle_to_neg_pi_to_pi(desired_heading - rtheta)
 
-            now = rospy.Time.now().to_sec()
+            front_dist = get_min_range_between_angles(
+                -math.radians(25.0),
+                math.radians(25.0)
+            )
+            left_dist = get_min_range_between_angles(
+                math.radians(25.0),
+                math.radians(80.0)
+            )
+            right_dist = get_min_range_between_angles(
+                -math.radians(80.0),
+                -math.radians(25.0)
+            )
+
+            now = rospy.get_time()
+            if now <= last_pid_time:
+                now = last_pid_time + MIN_DT
+            last_pid_time = now
+
+            linear_cmd = self.linear_pid.control(distance_error, now)
             angular_cmd = self.angular_pid.control(heading_error, now)
 
-            if abs(heading_error) > 0.35:
+            if abs(heading_error) > 0.45:
                 linear_cmd = 0.0
-            else:
-                linear_cmd = self.linear_pid.control(distance_error, now)
-                linear_cmd = max(0.0, min(0.12, linear_cmd))
 
-            if self.laserscan is not None:
-                ranges = np.array(self.laserscan.ranges, dtype=np.float64)
-                ranges[np.isinf(ranges)] = self.laserscan.range_max
-                ranges[np.isnan(ranges)] = self.laserscan.range_max
+            linear_cmd = max(0.0, min(0.18, linear_cmd))
+            angular_cmd = max(-1.2, min(1.2, angular_cmd))
 
-                mid_idx = len(ranges) // 2
-                angle_increment = self.laserscan.angle_increment
-                front_span = max(1, int((12.0 * math.pi / 180.0) / angle_increment))
-                front_low = max(0, mid_idx - front_span)
-                front_high = min(len(ranges), mid_idx + front_span + 1)
-                front_dist = float(np.min(ranges[front_low:front_high]))
+            if front_dist < 0.28:
+                linear_cmd = 0.0
 
-                if front_dist < 0.20:
-                    self.cmd_pub.publish(Twist())
-                    self.move_forward(-0.06)
-                    if heading_error >= 0.0:
-                        self.rotate_in_place(0.35)
-                    else:
-                        self.rotate_in_place(-0.35)
-                    continue
+                if left_dist >= right_dist:
+                    angular_cmd = 0.65
+                else:
+                    angular_cmd = -0.65
+
+                rospy.logwarn(
+                    "SAFETY STOP: front=%.3f left=%.3f right=%.3f -> rotate ang=%.2f" %
+                    (front_dist, left_dist, right_dist, angular_cmd)
+                )
+
+            elif front_dist < 0.40:
+                linear_cmd = min(linear_cmd, 0.06)
 
             twist = Twist()
             twist.linear.x = linear_cmd
             twist.angular.z = angular_cmd
             self.cmd_pub.publish(twist)
-            self.rate.sleep()
+
+            iteration += 1
+            if iteration % 10 == 0:
+                pf_x, pf_y, pf_t = self._pf.get_estimate()
+                rospy.logwarn(
+                    "iter=%d wp=%d odom=(%.2f,%.2f,%.2f) pf=(%.2f,%.2f,%.2f) "
+                    "goal=(%.2f,%.2f) dist=%.2f heading_err=%.2f "
+                    "front=%.2f left=%.2f right=%.2f cmd=(%.2f,%.2f)" %
+                    (
+                        iteration,
+                        current_wp_idx,
+                        rx,
+                        ry,
+                        rtheta,
+                        pf_x,
+                        pf_y,
+                        pf_t,
+                        waypoint["x"],
+                        waypoint["y"],
+                        distance_error,
+                        heading_error,
+                        front_dist,
+                        left_dist,
+                        right_dist,
+                        linear_cmd,
+                        angular_cmd,
+                    )
+                )
+
+            rate.sleep()
 
         self.cmd_pub.publish(Twist())
-        rospy.loginfo("Finished following plan.")
+
         ######### Your code ends here #########
 
     # ----------------------------------------------------------------------
