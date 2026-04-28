@@ -184,8 +184,17 @@ class PFRRTController:
         ######### Your code starts here #########
 
         def clean_range(r):
+            if self.laserscan is None:
+                return 10.0
+
             if np.isnan(r) or np.isinf(r):
                 return self.laserscan.range_max
+
+            # Real TurtleBot LDS often reports 0.0 as invalid.
+            # Treat anything <= range_min as no valid return, not as an obstacle at 0m.
+            if r <= self.laserscan.range_min + 1e-3:
+                return self.laserscan.range_max
+
             return r
 
         def get_min_range_between_angles(low_angle, high_angle):
@@ -310,7 +319,7 @@ class PFRRTController:
                     (x_est, y_est, theta_est, pos_spread, ang_spread)
                 )
 
-                if step > 15 and pos_spread < 0.18 and ang_spread < 0.35:
+                if step > 30 and pos_spread < 0.18 and ang_spread < 0.35:
                     rospy.loginfo(
                         "PF converged near x=%.3f, y=%.3f, theta=%.3f" %
                         (x_est, y_est, theta_est)
@@ -318,8 +327,21 @@ class PFRRTController:
                     break
 
             if stuck_turn_count > 8:
-                rospy.logwarn("Too many turns during localization; stopping localization early.")
-                break
+                rospy.logwarn("Too many turns during localization; backing up and trying a different direction.")
+                self.move_forward(-0.12)
+
+                twist = Twist()
+                twist.linear.x = 0.0
+                twist.angular.z = 0.8
+
+                start_time = rospy.Time.now().to_sec()
+                while (rospy.Time.now().to_sec() - start_time) < 1.2 and (not rospy.is_shutdown()):
+                    self.cmd_pub.publish(twist)
+                    self.rate.sleep()
+
+                self.cmd_pub.publish(Twist())
+                stuck_turn_count = 0
+                continue
 
             self.rate.sleep()
 
@@ -388,8 +410,17 @@ class PFRRTController:
         ######### Your code starts here #########
 
         def clean_range(r):
+            if self.laserscan is None:
+                return 10.0
+
             if np.isnan(r) or np.isinf(r):
                 return self.laserscan.range_max
+
+            # Real TurtleBot LDS often reports 0.0 as invalid.
+            # Treat anything <= range_min as no valid return, not as an obstacle at 0m.
+            if r <= self.laserscan.range_min + 1e-3:
+                return self.laserscan.range_max
+
             return r
 
         def get_min_range_between_angles(low_angle, high_angle):

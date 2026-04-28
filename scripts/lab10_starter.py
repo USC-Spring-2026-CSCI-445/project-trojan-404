@@ -132,21 +132,24 @@ class RrtPlanner:
         # Choose uniform randomly sampled points
         ######### Your code starts here #########
         x_min, x_max, y_min, y_max = self.map_aabb
-
-        while True:
-            x = np.random.uniform(x_min, x_max)
-            y = np.random.uniform(y_min, y_max)
-            q = Node(np.array([x, y]), None)
-            if not self._is_in_collision(q):
-                return q
+        x = np.random.uniform(x_min, x_max)
+        y = np.random.uniform(y_min, y_max)
+        return Node(np.array([x, y]), None)
         ######### Your code ends here #########
 
     def _nearest_vertex(self, graph: List[Node], q: Node) -> Node:
         # Determine vertex nearest to sampled point
         ######### Your code starts here #########
-        distances = [node.distance_to(q) for node in graph]
-        nearest_idx = int(np.argmin(distances))
-        return graph[nearest_idx]
+        nearest = graph[0]
+        min_dist = np.linalg.norm(q.position - nearest.position)
+        
+        for node in graph:
+            dist = np.linalg.norm(q.position - node.position)
+            if dist < min_dist:
+                min_dist = dist
+                nearest = node
+        
+        return nearest
         ######### Your code ends here #########
 
     def _is_in_collision(self, q_rand: Node):
@@ -166,37 +169,30 @@ class RrtPlanner:
 
         # Check if sampled point is in collision and add to tree if not
         ######### Your code starts here #########
-        # reject if in collision
         if self._is_in_collision(q_rand):
             return None
-
-        # find nearest vertex
+        
         q_near = self._nearest_vertex(graph, q_rand)
-
-        # direction
         direction = q_rand.position - q_near.position
         dist = np.linalg.norm(direction)
-        if dist == 0.0:
+        
+        if dist == 0:
             return None
-
-        # step by at most self.delta
-        step = min(self.delta, dist)
-        direction_unit = direction / dist
-        new_pos = q_near.position + step * direction_unit
-
-        # collision check
-        num_checks = max(int(np.ceil(step / (self.delta / 2.0))), 1)
-        for i in range(1, num_checks + 1):
-            alpha = i / (num_checks + 1)
-            interp_pos = q_near.position + alpha * (new_pos - q_near.position)
-            if self._is_in_collision(Node(interp_pos, None)):
-                return None
-
-        # create and add the new node
-        q_new = Node(new_pos, q_near)
-        graph.append(q_new)
+        
+        if dist <= self.delta:
+            new_position = q_rand.position.copy()
+        else:
+            new_position = q_near.position + (direction / dist) * self.delta
+        
+        q_new = Node(new_position, q_near)
+        
+        if self._is_in_collision(q_new):
+            return None
+        
         q_near.neighbors.append(q_new)
-
+        q_new.parent = q_near
+        graph.append(q_new)
+        
         return q_new
         ######### Your code ends here #########
 
@@ -224,45 +220,38 @@ class RrtPlanner:
 
         # Find path from start to goal location through tree
         ######### Your code starts here #########
-        max_iterations = 5000
-        goal_reached: Optional[Node] = None
-
+        max_iterations = 10000
+        found_goal_node = None
+        
         for _ in range(max_iterations):
-            # sample
             q_rand = self._randomly_sample_q()
-
-            # extend the tree
             q_new = self._extend(graph, q_rand)
+        
             if q_new is None:
                 continue
-
-            # check if within goal
+        
             if np.linalg.norm(q_new.position - goal_node.position) <= self.goal_threshold:
-                goal_reached = q_new
+                found_goal_node = q_new
                 break
+        
+        if found_goal_node is None:
+            return plan, graph
+        
+        backtrack = []
+        current = found_goal_node
+        while current is not None:
+            backtrack.append({"x": current.position[0], "y": current.position[1]})
+            current = current.parent
+        
+        backtrack.reverse()
+        
+        if len(backtrack) == 0 or (
+            abs(backtrack[-1]["x"] - goal["x"]) > 1e-6 or abs(backtrack[-1]["y"] - goal["y"]) > 1e-6
+        ):
+            backtrack.append({"x": goal["x"], "y": goal["y"]})
+        
+        plan = backtrack
 
-        # if never reached the goal, choose the closest node
-        if goal_reached is None:
-            dists_to_goal = [np.linalg.norm(node.position - goal_node.position) for node in graph]
-            closest_idx = int(np.argmin(dists_to_goal))
-            goal_reached = graph[closest_idx]
-
-        # backtrack to the root
-        path_nodes: List[Node] = []
-        node = goal_reached
-        while node is not None:
-            path_nodes.append(node)
-            node = node.parent
-
-        path_nodes.reverse()
-
-        # node to x, y dictionaries
-        for n in path_nodes:
-            plan.append({"x": float(n.position[0]), "y": float(n.position[1])})
-
-        # goal position included as last waypoint
-        if len(plan) == 0 or np.linalg.norm(goal_node.position - np.array([plan[-1]["x"], plan[-1]["y"]])) > 1e-3:
-            plan.append({"x": goal["x"], "y": goal["y"]})
         ######### Your code ends here #########
         return plan, graph
 
@@ -273,108 +262,70 @@ class RrtPlanner:
 class ObstacleFreeWaypointController:
     def __init__(self, waypoints: List[POSITION_TYPE]):
         self.waypoints = waypoints
-        self.current_idx = 0
+        self.waypoint_idx = 0
 
-        # current position
-        self.current_position: Optional[POSITION_TYPE] = None
-        self.odom_sub = rospy.Subscriber("/odom", Odometry, self.odom_callback)
-        self.vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+        self.current_position = {"x": 0.0, "y": 0.0, "theta": 0.0}
 
-        # PID controllers for linear and angular velocities
-        self.linear_controller = PIDController(0.3, 0.0, 0.1, 10, -0.22, 0.22)
-        self.angular_controller = PIDController(0.5, 0.0, 0.2, 10, -2.84, 2.84)
+        self.cmd_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+        self.odom_sub = rospy.Subscriber("/odom", Odometry, self._odom_callback)
+
+        self.goal_threshold = GOAL_THRESHOLD
+        self.max_linear_speed = 0.2
+        self.max_angular_speed = 0.8
 
         self.rate = rospy.Rate(10)
 
-    def odom_callback(self, msg: Odometry):
-        pose = msg.pose.pose
-        orientation = pose.orientation
-        _, _, theta = euler_from_quaternion([orientation.x, orientation.y, orientation.z, orientation.w])
+    def _odom_callback(self, msg: Odometry):
+        self.current_position["x"] = msg.pose.pose.position.x
+        self.current_position["y"] = msg.pose.pose.position.y
 
-        self.current_position = {"x": pose.position.x, "y": pose.position.y, "theta": theta}
+        q = msg.pose.pose.orientation
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self.current_position["theta"] = yaw
 
-    def _get_current_waypoint(self) -> Optional[POSITION_TYPE]:
-        if self.current_idx >= len(self.waypoints):
-            return None
-        return self.waypoints[self.current_idx]
-
-    def _calculate_error_to_waypoint(self) -> Optional[Tuple[float, float]]:
-        if self.current_position is None:
-            return None
-
-        waypoint = self._get_current_waypoint()
-        if waypoint is None:
-            return None
-
-        dx = waypoint["x"] - self.current_position["x"]
-        dy = waypoint["y"] - self.current_position["y"]
-        distance_error = sqrt(dx ** 2 + dy ** 2)
-
-        desired_theta = atan2(dy, dx)
-        angle_error = desired_theta - self.current_position["theta"]
-
-        if angle_error > pi:
-            angle_error -= 2 * pi
-        elif angle_error < -pi:
-            angle_error += 2 * pi
-
-        return distance_error, angle_error
+    def _stop_robot(self):
+        twist = Twist()
+        twist.linear.x = 0.0
+        twist.angular.z = 0.0
+        self.cmd_pub.publish(twist)
 
     def control_robot(self):
-        ctrl_msg = Twist()
-
-        if self.current_position is None:
-            self.vel_pub.publish(ctrl_msg)
+        if self.waypoint_idx >= len(self.waypoints):
+            self._stop_robot()
             self.rate.sleep()
             return
-
-        # stop when finished all waypoints
-        if self._get_current_waypoint() is None:
-            self.vel_pub.publish(ctrl_msg)
+    
+        target = self.waypoints[self.waypoint_idx]
+    
+        dx = target["x"] - self.current_position["x"]
+        dy = target["y"] - self.current_position["y"]
+        distance_error = sqrt(dx**2 + dy**2)
+    
+        if distance_error < self.goal_threshold:
+            self.waypoint_idx += 1
+            if self.waypoint_idx >= len(self.waypoints):
+                self._stop_robot()
             self.rate.sleep()
             return
-
-        error = self._calculate_error_to_waypoint()
-        if error is None:
-            self.vel_pub.publish(ctrl_msg)
-            self.rate.sleep()
-            return
-
-        distance_error, angle_error = error
-
-        # advance to next waypoint if close enough
-        if distance_error < GOAL_THRESHOLD:
-            self.current_idx += 1
-            # check if done
-            if self._get_current_waypoint() is None:
-                rospy.loginfo("Reached final waypoint.")
-                self.vel_pub.publish(Twist())
-                self.rate.sleep()
-                return
-            # find error to new waypoint
-            error = self._calculate_error_to_waypoint()
-            if error is None:
-                self.vel_pub.publish(Twist())
-                self.rate.sleep()
-                return
-            distance_error, angle_error = error
-
-        t_now = rospy.get_time()
-        cmd_linear_vel = self.linear_controller.control(distance_error, t_now)
-        cmd_angular_vel = self.angular_controller.control(angle_error, t_now)
-
-        # publish control commands
-        ctrl_msg.linear.x = cmd_linear_vel
-        ctrl_msg.angular.z = cmd_angular_vel
-        self.vel_pub.publish(ctrl_msg)
-
-        # check
-        rospy.loginfo(
-            f"wp_idx: {self.current_idx}/{len(self.waypoints)}\t"
-            f"dist_err: {distance_error:.2f}\tangle_err: {angle_error:.2f}\t"
-            f"v: {cmd_linear_vel:.2f}\tw: {cmd_angular_vel:.2f}"
-        )
-
+    
+        desired_theta = atan2(dy, dx)
+        angle_error = desired_theta - self.current_position["theta"]
+    
+        while angle_error > pi:
+            angle_error -= 2 * pi
+        while angle_error < -pi:
+            angle_error += 2 * pi
+    
+        twist = Twist()
+    
+        if abs(angle_error) > 0.2:
+            twist.linear.x = 0.0
+        else:
+            twist.linear.x = min(self.max_linear_speed, 0.15 * distance_error)
+    
+        twist.angular.z = max(-self.max_angular_speed, min(self.max_angular_speed, 1.2 * angle_error))
+    
+        self.cmd_pub.publish(twist)
         self.rate.sleep()
 ######### Your code ends here #########
 
